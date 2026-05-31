@@ -13,15 +13,18 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 安装 PostgreSQL 客户端
+      - name: 安装 PostgreSQL 17 客户端
         run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client
+          sudo apt-get install -y -qq postgresql-client-17
 
       - name: 执行备份
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
           DATE=$(date +%Y-%m-%d)
           DIR="backups/${DATE}"
           mkdir -p "${DIR}"
