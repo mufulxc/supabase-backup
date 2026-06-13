@@ -83,5 +83,5 @@ roles.sql → schema.sql → data.sql
 | 问题 | 可能原因 | 解决方案 |
 |------|---------|---------|
 | `无法连接到 Supabase 数据库` | `SUPABASE_DB_URL` 错误或密码过期 | 检查 Secret 是否正确，在 Supabase Dashboard 重新生成密码 |
-| `schema 备份失败` / `data 备份失败` | 数据库权限不足或磁盘空间不足 | 检查 Supabase 项目状态，确认数据库可访问 |
-| GitHub 推送保护拦截 | 备份数据中包含密钥 | 将含密钥的表添加到 `--exclude-table-data` 排除列表 |
+| `schema 备份失败` / `data 备份失败` | 数据库权限不足 | 检查 Supabase 项目状态，确认数据库可访问 |
+| GitHub 推送保护拦截 | Supabase 内部 schema（`auth`、`vault`）的数据中包含 JWT/service_role 密钥 | 确认工作流已配置 `--schema=public` 跳过内部 schema；如用户表中存了 API key，在 `--exclude-table-data` 中添加对应表名 |
