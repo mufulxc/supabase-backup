@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict dHJhG1wtpthqRN7fjAAgPBUgwgLMHj6ambc61NzDDZoHoyjK3q6Qx6wewq8U72O
+\restrict e0tf4ONT7tIrHQ0eiMP496r9AK3Ya5f2v7ZlCG1Y2djpGTbgD0GCOzQV4Ve8nCT
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -3629,6 +3629,17 @@ CREATE TABLE public.sticky_notes (
 
 
 --
+-- Name: sticky_notes_test; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sticky_notes_test (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    note_local_id text NOT NULL,
+    title text DEFAULT ''::text
+);
+
+
+--
 -- Name: stock_test; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4432,6 +4443,22 @@ ALTER TABLE ONLY public.sticky_notes
 
 ALTER TABLE ONLY public.sticky_notes
     ADD CONSTRAINT sticky_notes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sticky_notes_test sticky_notes_test_note_local_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sticky_notes_test
+    ADD CONSTRAINT sticky_notes_test_note_local_id_key UNIQUE (note_local_id);
+
+
+--
+-- Name: sticky_notes_test sticky_notes_test_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sticky_notes_test
+    ADD CONSTRAINT sticky_notes_test_pkey PRIMARY KEY (id);
 
 
 --
@@ -5588,5 +5615,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict dHJhG1wtpthqRN7fjAAgPBUgwgLMHj6ambc61NzDDZoHoyjK3q6Qx6wewq8U72O
+\unrestrict e0tf4ONT7tIrHQ0eiMP496r9AK3Ya5f2v7ZlCG1Y2djpGTbgD0GCOzQV4Ve8nCT
 

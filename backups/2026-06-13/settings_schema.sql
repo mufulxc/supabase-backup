@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict fY2vP8VbDtglthecDbr3m29DMuiu1O4aNRziYekPo8I4oTe7XyRRMgUOJsALSUd
+\restrict 6teXCQYGxW0MdylbjLJfJSs6GSYP07hSsWYQPIzX3FaBMri04IMXdmCkLhtySh1
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -58,5 +58,5 @@ ALTER TABLE public.settings ENABLE ROW LEVEL SECURITY;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict fY2vP8VbDtglthecDbr3m29DMuiu1O4aNRziYekPo8I4oTe7XyRRMgUOJsALSUd
+\unrestrict 6teXCQYGxW0MdylbjLJfJSs6GSYP07hSsWYQPIzX3FaBMri04IMXdmCkLhtySh1
 
