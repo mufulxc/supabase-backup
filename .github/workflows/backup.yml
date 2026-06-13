@@ -20,7 +20,6 @@ jobs:
 
       - name: 安装 PostgreSQL 17 客户端
         run: |
-          # 自动检测 Ubuntu 版本代号（兼容有无 lsb_release 的环境）
           CODENAME=$(lsb_release -cs 2>/dev/null || (. /etc/os-release && echo "$VERSION_CODENAME"))
           echo "Ubuntu 代号: ${CODENAME}"
 
@@ -34,7 +33,6 @@ jobs:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           export PATH="/usr/lib/postgresql/17/bin:$PATH"
-          # Supabase 要求 SSL 连接
           export PGSSLMODE=require
           DATE=$(date +%Y-%m-%d)
           DIR="backups/${DATE}"
@@ -49,7 +47,7 @@ jobs:
 
           FAILED=0
 
-          # 角色与权限
+          # ========== 1. 角色与权限 ==========
           echo "::group::备份角色与权限"
           if pg_dumpall \
             --dbname="${DB_URL}" \
@@ -65,7 +63,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-          # 表结构
+          # ========== 2. 表结构（全部 schema） ==========
           echo "::group::备份表结构"
           if pg_dump \
             --dbname="${DB_URL}" \
@@ -82,11 +80,17 @@ jobs:
           rm -f "${DIR}/schema.err"
           echo "::endgroup::"
 
-          # 数据
-          echo "::group::备份数据"
+          # ========== 3. 用户数据（仅 public schema，排除含密钥的表） ==========
+          # 重要：不导出 Supabase 内部 schema (auth/vault/storage/realtime) 的数据。
+          # 这些 schema 由 Supabase 管理，其数据中包含 JWT 密钥、service_role 密钥等，
+          # 会被 GitHub 推送保护拦截。如需迁移用户/存储数据，请在 Supabase Dashboard
+          # 中单独导出。
+          echo "::group::备份用户数据"
           if pg_dump \
             --dbname="${DB_URL}" \
             --data-only \
+            --schema=public \
+            --exclude-table-data=public.settings \
             --no-owner \
             --no-acl \
             > "${DIR}/data.sql" 2>"${DIR}/data.err"; then
@@ -99,6 +103,19 @@ jobs:
           rm -f "${DIR}/data.err"
           echo "::endgroup::"
 
+          # ========== 4. 敏感设置表（结构 + 空数据，供恢复参考） ==========
+          echo "::group::备份 settings 表结构"
+          pg_dump \
+            --dbname="${DB_URL}" \
+            --schema=public \
+            --table=public.settings \
+            --schema-only \
+            --no-owner \
+            --no-acl \
+            > "${DIR}/settings_schema.sql" 2>/dev/null || true
+          echo "settings_schema.sql: $(wc -c < ${DIR}/settings_schema.sql) bytes"
+          echo "::endgroup::"
+
           if [ "${FAILED}" -ne 0 ]; then
             echo "::error::备份过程中有步骤失败，请检查上方错误信息"
             exit 1
@@ -109,7 +126,6 @@ jobs:
       - name: 清理 7 天前的旧备份
         if: always()
         run: |
-          # 删除 7 天前的备份目录（基于目录名中的日期）
           find backups/ -maxdepth 1 -type d -name "????-??-??" | while read d; do
             dir_date=$(basename "$d")
             dir_epoch=$(date -d "$dir_date" +%s 2>/dev/null || echo 0)
