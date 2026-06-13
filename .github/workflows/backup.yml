@@ -123,13 +123,13 @@ jobs:
 
           echo "备份完成: ${DIR}"
 
-      - name: 清理 7 天前的旧备份
+      - name: 清理 90 天前的旧备份
         if: always()
         run: |
           find backups/ -maxdepth 1 -type d -name "????-??-??" | while read d; do
             dir_date=$(basename "$d")
             dir_epoch=$(date -d "$dir_date" +%s 2>/dev/null || echo 0)
-            cutoff_epoch=$(date -d "7 days ago" +%s)
+            cutoff_epoch=$(date -d "90 days ago" +%s)
             if [ "$dir_epoch" -lt "$cutoff_epoch" ] 2>/dev/null; then
               echo "删除过期备份: $d"
               rm -rf "$d"
