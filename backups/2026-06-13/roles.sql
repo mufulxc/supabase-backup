@@ -2,7 +2,7 @@
 -- PostgreSQL database cluster dump
 --
 
-\restrict 1u0B5VJ0TgZTqsRfJIIzwOTFvahZkKHmkdMrchKB1Z8Fr2PigKQmx7FF3evSxaJ
+\restrict faqRXTEQMVTt9OBwdrEEhprCvdSo1b71VNR3SM0UaIAPk261jh5FTsT9UKV1xo8
 
 SET default_transaction_read_only = off;
 
@@ -33,6 +33,8 @@ CREATE ROLE supabase_auth_admin;
 ALTER ROLE supabase_auth_admin WITH NOSUPERUSER NOINHERIT CREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
 CREATE ROLE supabase_etl_admin;
 ALTER ROLE supabase_etl_admin WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN REPLICATION BYPASSRLS;
+CREATE ROLE supabase_functions_admin;
+ALTER ROLE supabase_functions_admin WITH NOSUPERUSER NOINHERIT CREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS;
 CREATE ROLE supabase_privileged_role;
 ALTER ROLE supabase_privileged_role WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB NOLOGIN NOREPLICATION NOBYPASSRLS;
 CREATE ROLE supabase_read_only_user;
@@ -128,7 +130,7 @@ GRANT supabase_privileged_role TO supabase_etl_admin WITH INHERIT TRUE GRANTED B
 GRANT supabase_realtime_admin TO postgres WITH INHERIT TRUE GRANTED BY supabase_admin;
 
 
-\unrestrict 1u0B5VJ0TgZTqsRfJIIzwOTFvahZkKHmkdMrchKB1Z8Fr2PigKQmx7FF3evSxaJ
+\unrestrict faqRXTEQMVTt9OBwdrEEhprCvdSo1b71VNR3SM0UaIAPk261jh5FTsT9UKV1xo8
 
 --
 -- PostgreSQL database cluster dump complete

@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict qoRUi9R1CgItznAJ7ydUDu2SrB7nCHCQi2GX64deBpIougvjpoes6USaYTRh9F0
+\restrict dHJhG1wtpthqRN7fjAAgPBUgwgLMHj6ambc61NzDDZoHoyjK3q6Qx6wewq8U72O
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -27,6 +27,20 @@ CREATE SCHEMA auth;
 
 
 --
+-- Name: pg_cron; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_cron WITH SCHEMA pg_catalog;
+
+
+--
+-- Name: EXTENSION pg_cron; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_cron IS 'Job scheduler for PostgreSQL';
+
+
+--
 -- Name: extensions; Type: SCHEMA; Schema: -; Owner: -
 --
 
@@ -45,6 +59,20 @@ CREATE SCHEMA graphql;
 --
 
 CREATE SCHEMA graphql_public;
+
+
+--
+-- Name: pg_net; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
+
+
+--
+-- Name: EXTENSION pg_net; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_net IS 'Async HTTP';
 
 
 --
@@ -782,119 +810,114 @@ CREATE FUNCTION realtime.apply_rls(wal jsonb, max_record_bytes integer DEFAULT (
     LANGUAGE plpgsql
     AS $$
 declare
--- Regclass of the table e.g. public.notes
-entity_ regclass = (quote_ident(wal ->> 'schema') || '.' || quote_ident(wal ->> 'table'))::regclass;
+    -- Regclass of the table e.g. public.notes
+    entity_ regclass = (quote_ident(wal ->> 'schema') || '.' || quote_ident(wal ->> 'table'))::regclass;
 
--- I, U, D, T: insert, update ...
-action realtime.action = (
-    case wal ->> 'action'
-        when 'I' then 'INSERT'
-        when 'U' then 'UPDATE'
-        when 'D' then 'DELETE'
-        else 'ERROR'
-    end
-);
+    -- I, U, D, T: insert, update ...
+    action realtime.action = (
+        case wal ->> 'action'
+            when 'I' then 'INSERT'
+            when 'U' then 'UPDATE'
+            when 'D' then 'DELETE'
+            else 'ERROR'
+        end
+    );
 
--- Is row level security enabled for the table
-is_rls_enabled bool = relrowsecurity from pg_class where oid = entity_;
+    -- Is row level security enabled for the table
+    is_rls_enabled bool = relrowsecurity from pg_class where oid = entity_;
 
-subscriptions realtime.subscription[] = array_agg(subs)
-    from
-        realtime.subscription subs
-    where
-        subs.entity = entity_
-        -- Filter by action early - only get subscriptions interested in this action
-        -- action_filter column can be: '*' (all), 'INSERT', 'UPDATE', or 'DELETE'
-        and (subs.action_filter = '*' or subs.action_filter = action::text);
+    subscriptions realtime.subscription[] = array_agg(subs)
+        from
+            realtime.subscription subs
+        where
+            subs.entity = entity_
+            -- Filter by action early - only get subscriptions interested in this action
+            -- action_filter column can be: '*' (all), 'INSERT', 'UPDATE', or 'DELETE'
+            and (subs.action_filter = '*' or subs.action_filter = action::text);
 
--- Subscription vars
-roles regrole[] = array_agg(distinct us.claims_role::text)
-    from
-        unnest(subscriptions) us;
+    -- Subscription vars
+    working_role regrole;
+    working_selected_columns text[];
+    claimed_role regrole;
+    claims jsonb;
 
-working_role regrole;
-claimed_role regrole;
-claims jsonb;
+    subscription_id uuid;
+    subscription_has_access bool;
+    visible_to_subscription_ids uuid[] = '{}';
 
-subscription_id uuid;
-subscription_has_access bool;
-visible_to_subscription_ids uuid[] = '{}';
+    -- structured info for wal's columns
+    columns realtime.wal_column[];
+    -- previous identity values for update/delete
+    old_columns realtime.wal_column[];
 
--- structured info for wal's columns
-columns realtime.wal_column[];
--- previous identity values for update/delete
-old_columns realtime.wal_column[];
+    error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
 
-error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
+    -- Primary jsonb output for record
+    output jsonb;
 
--- Primary jsonb output for record
-output jsonb;
+    -- Loop record for iterating unique roles (outer loop)
+    role_record record;
+    -- Loop record for iterating unique selected_columns within a role (inner loop)
+    cols_record record;
+    -- Subscription ids visible at the role level (before fanning out by selected_columns)
+    visible_role_sub_ids uuid[] = '{}';
 
 begin
-perform set_config('role', null, true);
+    perform set_config('role', null, true);
 
-columns =
-    array_agg(
-        (
-            x->>'name',
-            x->>'type',
-            x->>'typeoid',
-            realtime.cast(
-                (x->'value') #>> '{}',
-                coalesce(
-                    (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
-                    (x->>'type')::regtype
-                )
-            ),
-            (pks ->> 'name') is not null,
-            true
-        )::realtime.wal_column
-    )
-    from
-        jsonb_array_elements(wal -> 'columns') x
-        left join jsonb_array_elements(wal -> 'pk') pks
-            on (x ->> 'name') = (pks ->> 'name');
-
-old_columns =
-    array_agg(
-        (
-            x->>'name',
-            x->>'type',
-            x->>'typeoid',
-            realtime.cast(
-                (x->'value') #>> '{}',
-                coalesce(
-                    (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
-                    (x->>'type')::regtype
-                )
-            ),
-            (pks ->> 'name') is not null,
-            true
-        )::realtime.wal_column
-    )
-    from
-        jsonb_array_elements(wal -> 'identity') x
-        left join jsonb_array_elements(wal -> 'pk') pks
-            on (x ->> 'name') = (pks ->> 'name');
-
-for working_role in select * from unnest(roles) loop
-
-    -- Update `is_selectable` for columns and old_columns
     columns =
         array_agg(
             (
-                c.name,
-                c.type_name,
-                c.type_oid,
-                c.value,
-                c.is_pkey,
-                pg_catalog.has_column_privilege(working_role, entity_, c.name, 'SELECT')
+                x->>'name',
+                x->>'type',
+                x->>'typeoid',
+                realtime.cast(
+                    (x->'value') #>> '{}',
+                    coalesce(
+                        (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
+                        (x->>'type')::regtype
+                    )
+                ),
+                (pks ->> 'name') is not null,
+                true
             )::realtime.wal_column
         )
         from
-            unnest(columns) c;
+            jsonb_array_elements(wal -> 'columns') x
+            left join jsonb_array_elements(wal -> 'pk') pks
+                on (x ->> 'name') = (pks ->> 'name');
 
     old_columns =
+        array_agg(
+            (
+                x->>'name',
+                x->>'type',
+                x->>'typeoid',
+                realtime.cast(
+                    (x->'value') #>> '{}',
+                    coalesce(
+                        (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
+                        (x->>'type')::regtype
+                    )
+                ),
+                (pks ->> 'name') is not null,
+                true
+            )::realtime.wal_column
+        )
+        from
+            jsonb_array_elements(wal -> 'identity') x
+            left join jsonb_array_elements(wal -> 'pk') pks
+                on (x ->> 'name') = (pks ->> 'name');
+
+    for role_record in
+        select claims_role
+        from (select distinct claims_role from unnest(subscriptions)) t
+        order by claims_role::text
+    loop
+        working_role := role_record.claims_role;
+
+        -- Update `is_selectable` for columns and old_columns (once per role)
+        columns =
             array_agg(
                 (
                     c.name,
@@ -906,178 +929,238 @@ for working_role in select * from unnest(roles) loop
                 )::realtime.wal_column
             )
             from
-                unnest(old_columns) c;
+                unnest(columns) c;
 
-    if action <> 'DELETE' and count(1) = 0 from unnest(columns) c where c.is_pkey then
-        return next (
-            jsonb_build_object(
-                'schema', wal ->> 'schema',
-                'table', wal ->> 'table',
-                'type', action
-            ),
-            is_rls_enabled,
-            -- subscriptions is already filtered by entity
-            (select array_agg(s.subscription_id) from unnest(subscriptions) as s where claims_role = working_role),
-            array['Error 400: Bad Request, no primary key']
-        )::realtime.wal_rls;
-
-    -- The claims role does not have SELECT permission to the primary key of entity
-    elsif action <> 'DELETE' and sum(c.is_selectable::int) <> count(1) from unnest(columns) c where c.is_pkey then
-        return next (
-            jsonb_build_object(
-                'schema', wal ->> 'schema',
-                'table', wal ->> 'table',
-                'type', action
-            ),
-            is_rls_enabled,
-            (select array_agg(s.subscription_id) from unnest(subscriptions) as s where claims_role = working_role),
-            array['Error 401: Unauthorized']
-        )::realtime.wal_rls;
-
-    else
-        output = jsonb_build_object(
-            'schema', wal ->> 'schema',
-            'table', wal ->> 'table',
-            'type', action,
-            'commit_timestamp', to_char(
-                ((wal ->> 'timestamp')::timestamptz at time zone 'utc'),
-                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-            ),
-            'columns', (
-                select
-                    jsonb_agg(
-                        jsonb_build_object(
-                            'name', pa.attname,
-                            'type', pt.typname
-                        )
-                        order by pa.attnum asc
-                    )
-                from
-                    pg_attribute pa
-                    join pg_type pt
-                        on pa.atttypid = pt.oid
-                where
-                    attrelid = entity_
-                    and attnum > 0
-                    and pg_catalog.has_column_privilege(working_role, entity_, pa.attname, 'SELECT')
-            )
-        )
-        -- Add "record" key for insert and update
-        || case
-            when action in ('INSERT', 'UPDATE') then
-                jsonb_build_object(
-                    'record',
+        old_columns =
+                array_agg(
                     (
+                        c.name,
+                        c.type_name,
+                        c.type_oid,
+                        c.value,
+                        c.is_pkey,
+                        pg_catalog.has_column_privilege(working_role, entity_, c.name, 'SELECT')
+                    )::realtime.wal_column
+                )
+                from
+                    unnest(old_columns) c;
+
+        if action <> 'DELETE' and count(1) = 0 from unnest(columns) c where c.is_pkey then
+            -- Fan out 400 error per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+                return next (
+                    jsonb_build_object(
+                        'schema', wal ->> 'schema',
+                        'table', wal ->> 'table',
+                        'type', action
+                    ),
+                    is_rls_enabled,
+                    (select array_agg(s.subscription_id) from unnest(subscriptions) as s where s.claims_role = working_role and (s.selected_columns is not distinct from working_selected_columns)),
+                    array['Error 400: Bad Request, no primary key']
+                )::realtime.wal_rls;
+            end loop;
+
+        -- The claims role does not have SELECT permission to the primary key of entity
+        elsif action <> 'DELETE' and sum(c.is_selectable::int) <> count(1) from unnest(columns) c where c.is_pkey then
+            -- Fan out 401 error per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+                return next (
+                    jsonb_build_object(
+                        'schema', wal ->> 'schema',
+                        'table', wal ->> 'table',
+                        'type', action
+                    ),
+                    is_rls_enabled,
+                    (select array_agg(s.subscription_id) from unnest(subscriptions) as s where s.claims_role = working_role and (s.selected_columns is not distinct from working_selected_columns)),
+                    array['Error 401: Unauthorized']
+                )::realtime.wal_rls;
+            end loop;
+
+        else
+            -- Create the prepared statement (once per role)
+            if is_rls_enabled and action <> 'DELETE' then
+                if (select 1 from pg_prepared_statements where name = 'walrus_rls_stmt' limit 1) > 0 then
+                    deallocate walrus_rls_stmt;
+                end if;
+                execute realtime.build_prepared_statement_sql('walrus_rls_stmt', entity_, columns);
+            end if;
+
+            -- Collect all visible subscription IDs for this role (filter check + RLS check)
+            visible_role_sub_ids = '{}';
+
+            for subscription_id, claims in (
+                    select
+                        subs.subscription_id,
+                        subs.claims
+                    from
+                        unnest(subscriptions) subs
+                    where
+                        subs.entity = entity_
+                        and subs.claims_role = working_role
+                        and (
+                            realtime.is_visible_through_filters(columns, subs.filters)
+                            or (
+                              action = 'DELETE'
+                              and realtime.is_visible_through_filters(old_columns, subs.filters)
+                            )
+                        )
+            ) loop
+
+                if not is_rls_enabled or action = 'DELETE' then
+                    visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+                else
+                    -- Check if RLS allows the role to see the record
+                    perform
+                        -- Trim leading and trailing quotes from working_role because set_config
+                        -- doesn't recognize the role as valid if they are included
+                        set_config('role', trim(both '"' from working_role::text), true),
+                        set_config('request.jwt.claims', claims::text, true);
+
+                    execute 'execute walrus_rls_stmt' into subscription_has_access;
+
+                    if subscription_has_access then
+                        visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+                    end if;
+                end if;
+            end loop;
+
+            perform set_config('role', null, true);
+
+            -- Inner loop: per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+
+                output = jsonb_build_object(
+                    'schema', wal ->> 'schema',
+                    'table', wal ->> 'table',
+                    'type', action,
+                    'commit_timestamp', to_char(
+                        ((wal ->> 'timestamp')::timestamptz at time zone 'utc'),
+                        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                    ),
+                    'columns', (
                         select
-                            jsonb_object_agg(
-                                -- if unchanged toast, get column name and value from old record
-                                coalesce((c).name, (oc).name),
-                                case
-                                    when (c).name is null then (oc).value
-                                    else (c).value
-                                end
+                            jsonb_agg(
+                                jsonb_build_object(
+                                    'name', pa.attname,
+                                    'type', pt.typname
+                                )
+                                order by pa.attnum asc
                             )
                         from
-                            unnest(columns) c
-                            full outer join unnest(old_columns) oc
-                                on (c).name = (oc).name
+                            pg_attribute pa
+                            join pg_type pt
+                                on pa.atttypid = pt.oid
+                            left join (
+                                select unnest(conkey) as pkey_attnum
+                                from pg_constraint
+                                where conrelid = entity_ and contype = 'p'
+                            ) pk on pk.pkey_attnum = pa.attnum
                         where
-                            coalesce((c).is_selectable, (oc).is_selectable)
-                            and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                            attrelid = entity_
+                            and attnum > 0
+                            and pg_catalog.has_column_privilege(working_role, entity_, pa.attname, 'SELECT')
+                            and (working_selected_columns is null or pa.attname = any(working_selected_columns) or pk.pkey_attnum is not null)
                     )
                 )
-            else '{}'::jsonb
-        end
-        -- Add "old_record" key for update and delete
-        || case
-            when action = 'UPDATE' then
-                jsonb_build_object(
-                        'old_record',
-                        (
-                            select jsonb_object_agg((c).name, (c).value)
-                            from unnest(old_columns) c
-                            where
-                                (c).is_selectable
-                                and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                -- Add "record" key for insert and update
+                || case
+                    when action in ('INSERT', 'UPDATE') then
+                        jsonb_build_object(
+                            'record',
+                            (
+                                select
+                                    jsonb_object_agg(
+                                        -- if unchanged toast, get column name and value from old record
+                                        coalesce((c).name, (oc).name),
+                                        case
+                                            when (c).name is null then (oc).value
+                                            else (c).value
+                                        end
+                                    )
+                                from
+                                    unnest(columns) c
+                                    full outer join unnest(old_columns) oc
+                                        on (c).name = (oc).name
+                                where
+                                    coalesce((c).is_selectable, (oc).is_selectable)
+                                    and (working_selected_columns is null or coalesce((c).name, (oc).name) = any(working_selected_columns) or coalesce((c).is_pkey, (oc).is_pkey))
+                                    and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                            )
                         )
-                    )
-            when action = 'DELETE' then
-                jsonb_build_object(
-                    'old_record',
+                    else '{}'::jsonb
+                end
+                -- Add "old_record" key for update and delete
+                || case
+                    when action = 'UPDATE' then
+                        jsonb_build_object(
+                                'old_record',
+                                (
+                                    select jsonb_object_agg((c).name, (c).value)
+                                    from unnest(old_columns) c
+                                    where
+                                        (c).is_selectable
+                                        and (working_selected_columns is null or (c).name = any(working_selected_columns) or (c).is_pkey)
+                                        and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                                )
+                            )
+                    when action = 'DELETE' then
+                        jsonb_build_object(
+                            'old_record',
+                            (
+                                select jsonb_object_agg((c).name, (c).value)
+                                from unnest(old_columns) c
+                                where
+                                    (c).is_selectable
+                                    and (working_selected_columns is null or (c).name = any(working_selected_columns) or (c).is_pkey)
+                                    and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                                    and ( not is_rls_enabled or (c).is_pkey ) -- if RLS enabled, we can't secure deletes so filter to pkey
+                            )
+                        )
+                    else '{}'::jsonb
+                end;
+
+                -- Filter visible_role_sub_ids to those matching the current selected_columns group
+                visible_to_subscription_ids = coalesce(
                     (
-                        select jsonb_object_agg((c).name, (c).value)
-                        from unnest(old_columns) c
-                        where
-                            (c).is_selectable
-                            and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
-                            and ( not is_rls_enabled or (c).is_pkey ) -- if RLS enabled, we can't secure deletes so filter to pkey
-                    )
-                )
-            else '{}'::jsonb
-        end;
+                        select array_agg(s.subscription_id)
+                        from unnest(subscriptions) s
+                        where s.claims_role = working_role
+                          and (s.selected_columns is not distinct from working_selected_columns)
+                          and s.subscription_id = any(visible_role_sub_ids)
+                    ),
+                    '{}'::uuid[]
+                );
 
-        -- Create the prepared statement
-        if is_rls_enabled and action <> 'DELETE' then
-            if (select 1 from pg_prepared_statements where name = 'walrus_rls_stmt' limit 1) > 0 then
-                deallocate walrus_rls_stmt;
-            end if;
-            execute realtime.build_prepared_statement_sql('walrus_rls_stmt', entity_, columns);
+                return next (
+                    output,
+                    is_rls_enabled,
+                    visible_to_subscription_ids,
+                    case
+                        when error_record_exceeds_max_size then array['Error 413: Payload Too Large']
+                        else '{}'
+                    end
+                )::realtime.wal_rls;
+            end loop;
+
         end if;
+    end loop;
 
-        visible_to_subscription_ids = '{}';
-
-        for subscription_id, claims in (
-                select
-                    subs.subscription_id,
-                    subs.claims
-                from
-                    unnest(subscriptions) subs
-                where
-                    subs.entity = entity_
-                    and subs.claims_role = working_role
-                    and (
-                        realtime.is_visible_through_filters(columns, subs.filters)
-                        or (
-                          action = 'DELETE'
-                          and realtime.is_visible_through_filters(old_columns, subs.filters)
-                        )
-                    )
-        ) loop
-
-            if not is_rls_enabled or action = 'DELETE' then
-                visible_to_subscription_ids = visible_to_subscription_ids || subscription_id;
-            else
-                -- Check if RLS allows the role to see the record
-                perform
-                    -- Trim leading and trailing quotes from working_role because set_config
-                    -- doesn't recognize the role as valid if they are included
-                    set_config('role', trim(both '"' from working_role::text), true),
-                    set_config('request.jwt.claims', claims::text, true);
-
-                execute 'execute walrus_rls_stmt' into subscription_has_access;
-
-                if subscription_has_access then
-                    visible_to_subscription_ids = visible_to_subscription_ids || subscription_id;
-                end if;
-            end if;
-        end loop;
-
-        perform set_config('role', null, true);
-
-        return next (
-            output,
-            is_rls_enabled,
-            visible_to_subscription_ids,
-            case
-                when error_record_exceeds_max_size then array['Error 413: Payload Too Large']
-                else '{}'
-            end
-        )::realtime.wal_rls;
-
-    end if;
-end loop;
-
-perform set_config('role', null, true);
+    perform set_config('role', null, true);
 end;
 $$;
 
@@ -1258,7 +1341,7 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
         string_agg(
           realtime.quote_wal2json(format('%I.%I', schemaname, tablename)::regclass),
           ','
-        ) filter (WHERE ppt.tablename IS NOT NULL AND ppt.tablename NOT LIKE '% %'),
+        ) filter (WHERE ppt.tablename IS NOT NULL),
         ''
       ) AS w2j_add_tables
     FROM pg_publication pp
@@ -1282,13 +1365,11 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
            'add-tables', pub.w2j_add_tables
          ) x
   ),
-  -- Count raw slot entries before apply_rls/subscription filter
   slot_count AS (
     SELECT count(*)::bigint AS cnt
     FROM w2j
     WHERE w2j.w2j_add_tables <> ''
   ),
-  -- Apply RLS and filter as before
   rls_filtered AS (
     SELECT xyz.wal, xyz.is_rls_enabled, xyz.subscription_ids, xyz.errors
     FROM w2j,
@@ -1299,14 +1380,11 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
     WHERE w2j.w2j_add_tables <> ''
       AND xyz.subscription_ids[1] IS NOT NULL
   )
-  -- Real rows with slot count attached
   SELECT rf.wal, rf.is_rls_enabled, rf.subscription_ids, rf.errors, sc.cnt
   FROM rls_filtered rf, slot_count sc
 
   UNION ALL
 
-  -- Sentinel row: always returned when no real rows exist so Elixir can
-  -- always read slot_changes_count. Identified by wal IS NULL.
   SELECT null, null, null, null, sc.cnt
   FROM slot_count sc
   WHERE NOT EXISTS (SELECT 1 FROM rls_filtered)
@@ -1320,35 +1398,14 @@ $$;
 CREATE FUNCTION realtime.quote_wal2json(entity regclass) RETURNS text
     LANGUAGE sql IMMUTABLE STRICT
     AS $$
-      select
-        (
-          select string_agg('' || ch,'')
-          from unnest(string_to_array(nsp.nspname::text, null)) with ordinality x(ch, idx)
-          where
-            not (x.idx = 1 and x.ch = '"')
-            and not (
-              x.idx = array_length(string_to_array(nsp.nspname::text, null), 1)
-              and x.ch = '"'
-            )
-        )
-        || '.'
-        || (
-          select string_agg('' || ch,'')
-          from unnest(string_to_array(pc.relname::text, null)) with ordinality x(ch, idx)
-          where
-            not (x.idx = 1 and x.ch = '"')
-            and not (
-              x.idx = array_length(string_to_array(nsp.nspname::text, null), 1)
-              and x.ch = '"'
-            )
-          )
-      from
-        pg_class pc
-        join pg_namespace nsp
-          on pc.relnamespace = nsp.oid
-      where
-        pc.oid = entity
-    $$;
+  SELECT
+    realtime.wal2json_escape_identifier(nsp.nspname::text)
+    || '.'
+    || realtime.wal2json_escape_identifier(pc.relname::text)
+  FROM pg_class pc
+  JOIN pg_namespace nsp ON pc.relnamespace = nsp.oid
+  WHERE pc.oid = entity
+$$;
 
 
 --
@@ -1389,77 +1446,119 @@ $$;
 
 
 --
+-- Name: send_binary(bytea, text, text, boolean); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean DEFAULT true) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  generated_id uuid;
+BEGIN
+  BEGIN
+    generated_id := gen_random_uuid();
+
+    EXECUTE format('SET LOCAL realtime.topic TO %L', topic);
+
+    INSERT INTO realtime.messages (id, binary_payload, event, topic, private, extension)
+    VALUES (generated_id, payload, event, topic, private, 'broadcast');
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+  END;
+END;
+$$;
+
+
+--
 -- Name: subscription_check_filters(); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
 CREATE FUNCTION realtime.subscription_check_filters() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-    /*
-    Validates that the user defined filters for a subscription:
-    - refer to valid columns that the claimed role may access
-    - values are coercable to the correct column type
-    */
-    declare
-        col_names text[] = coalesce(
-                array_agg(c.column_name order by c.ordinal_position),
-                '{}'::text[]
-            )
-            from
-                information_schema.columns c
-            where
-                format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
-                and pg_catalog.has_column_privilege(
-                    (new.claims ->> 'role'),
-                    format('%I.%I', c.table_schema, c.table_name)::regclass,
-                    c.column_name,
-                    'SELECT'
-                );
-        filter realtime.user_defined_filter;
-        col_type regtype;
-
-        in_val jsonb;
-    begin
-        for filter in select * from unnest(new.filters) loop
-            -- Filtered column is valid
-            if not filter.column_name = any(col_names) then
-                raise exception 'invalid column for filter %', filter.column_name;
-            end if;
-
-            -- Type is sanitized and safe for string interpolation
-            col_type = (
-                select atttypid::regtype
-                from pg_catalog.pg_attribute
-                where attrelid = new.entity
-                      and attname = filter.column_name
+declare
+    col_names text[] = coalesce(
+            array_agg(c.column_name order by c.ordinal_position),
+            '{}'::text[]
+        )
+        from
+            information_schema.columns c
+        where
+            format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
+            and pg_catalog.has_column_privilege(
+                (new.claims ->> 'role'),
+                format('%I.%I', c.table_schema, c.table_name)::regclass,
+                c.column_name,
+                'SELECT'
             );
-            if col_type is null then
-                raise exception 'failed to lookup type for column %', filter.column_name;
-            end if;
+    table_col_names text[] = coalesce(
+            array_agg(pa.attname),
+            '{}'::text[]
+        )
+        from
+            pg_attribute pa
+        where
+            pa.attrelid = new.entity
+            and pa.attnum > 0;
+    filter realtime.user_defined_filter;
+    col_type regtype;
+    in_val jsonb;
+    selected_col text;
+begin
+    for filter in select * from unnest(new.filters) loop
+        -- Filtered column is valid
+        if not filter.column_name = any(col_names) then
+            raise exception 'invalid column for filter %', filter.column_name;
+        end if;
 
-            -- Set maximum number of entries for in filter
-            if filter.op = 'in'::realtime.equality_op then
-                in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
-                if coalesce(jsonb_array_length(in_val), 0) > 100 then
-                    raise exception 'too many values for `in` filter. Maximum 100';
-                end if;
-            else
-                -- raises an exception if value is not coercable to type
-                perform realtime.cast(filter.value, col_type);
+        -- Type is sanitized and safe for string interpolation
+        col_type = (
+            select atttypid::regtype
+            from pg_catalog.pg_attribute
+            where attrelid = new.entity
+                  and attname = filter.column_name
+        );
+        if col_type is null then
+            raise exception 'failed to lookup type for column %', filter.column_name;
+        end if;
+        if filter.op = 'in'::realtime.equality_op then
+            in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
+            if coalesce(jsonb_array_length(in_val), 0) > 100 then
+                raise exception 'too many values for `in` filter. Maximum 100';
             end if;
+        else
+            -- raises an exception if value is not coercable to type
+            perform realtime.cast(filter.value, col_type);
+        end if;
+    end loop;
 
+    -- Validate that selected_columns reference columns the role can SELECT
+    if new.selected_columns is not null then
+        for selected_col in select * from unnest(new.selected_columns) loop
+            if not selected_col = any(col_names) then
+                raise exception 'invalid column for select %', selected_col;
+            end if;
         end loop;
+    end if;
 
-        -- Apply consistent order to filters so the unique constraint on
-        -- (subscription_id, entity, filters) can't be tricked by a different filter order
-        new.filters = coalesce(
-            array_agg(f order by f.column_name, f.op, f.value),
-            '{}'
-        ) from unnest(new.filters) f;
+    -- Apply consistent order to filters so the unique constraint on
+    -- (subscription_id, entity, filters) can't be tricked by a different filter order
+    new.filters = coalesce(
+        array_agg(f order by f.column_name, f.op, f.value),
+        '{}'
+    ) from unnest(new.filters) f;
 
-        return new;
-    end;
-    $$;
+    -- Normalize selected_columns order so ARRAY['a','b'] and ARRAY['b','a'] are
+    -- treated as the same subscription group in apply_rls
+    new.selected_columns = (
+        select array_agg(c order by c)
+        from unnest(new.selected_columns) c
+    );
+
+    return new;
+end;
+$$;
 
 
 --
@@ -1479,6 +1578,18 @@ CREATE FUNCTION realtime.topic() RETURNS text
     LANGUAGE sql STABLE
     AS $$
 select nullif(current_setting('realtime.topic', true), '')::text;
+$$;
+
+
+--
+-- Name: wal2json_escape_identifier(text); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.wal2json_escape_identifier(name text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $$
+  -- Prefix `\`, `,`, `.`, and any whitespace with `\`
+  SELECT regexp_replace(name, '([\\,.[:space:]])', '\\\1', 'g')
 $$;
 
 
@@ -3102,6 +3213,16 @@ CREATE TABLE public.binance_trades (
 
 
 --
+-- Name: bond_mapping; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bond_mapping (
+    short_name text NOT NULL,
+    cusip text NOT NULL
+);
+
+
+--
 -- Name: ibkr_trad; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3137,10 +3258,16 @@ ALTER TABLE public.ibkr_trad ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
 --
 
 CREATE VIEW public.ibkr_view_bond AS
- SELECT '债息和'::text AS symbol,
-    sum(proceeds) AS total_proceeds
+ SELECT ibkr_trad.symbol,
+    sum(ibkr_trad.proceeds) AS total_proceeds
    FROM public.ibkr_trad
-  WHERE (asset = '债券利息'::text);
+  WHERE (ibkr_trad.asset = '债券利息'::text)
+  GROUP BY ibkr_trad.symbol
+UNION ALL
+ SELECT '债息和'::text AS symbol,
+    sum(ibkr_trad.proceeds) AS total_proceeds
+   FROM public.ibkr_trad
+  WHERE (ibkr_trad.asset = '债券利息'::text);
 
 
 --
@@ -3205,7 +3332,7 @@ CREATE VIEW public.ibkr_view_dividend_total AS
            FROM public.ibkr_view_dividend
           ORDER BY ibkr_view_dividend.total_proceeds) sorted_dividends
 UNION ALL
- SELECT '股息和'::text AS symbol,
+ SELECT '红利和'::text AS symbol,
     sum(ibkr_view_dividend.total_proceeds) AS total_proceeds
    FROM public.ibkr_view_dividend;
 
@@ -3371,6 +3498,17 @@ CREATE VIEW public.ibkr_view_option AS
 
 
 --
+-- Name: market_prices; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.market_prices (
+    symbol text NOT NULL,
+    price numeric(12,4) NOT NULL,
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
 -- Name: notes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3476,6 +3614,47 @@ CREATE TABLE public.settings (
 
 
 --
+-- Name: sticky_notes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sticky_notes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    note_local_id text NOT NULL,
+    folder text DEFAULT ''::text NOT NULL,
+    panel_index integer DEFAULT 0 NOT NULL,
+    content text DEFAULT ''::text,
+    title text DEFAULT ''::text,
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: stock_test; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stock_test (
+    id bigint NOT NULL,
+    symbol text NOT NULL,
+    price numeric,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: stock_test_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.stock_test ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.stock_test_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: taobao_stock_qty; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3483,8 +3662,30 @@ CREATE TABLE public.taobao_stock_qty (
     "英文代码" text,
     "产品名称" text,
     "库存量" bigint,
-    "批发价" bigint
+    "批发价" numeric(10,2),
+    "描述" text,
+    "品牌" text,
+    id bigint NOT NULL
 );
+
+
+--
+-- Name: taobao_stock_qty_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.taobao_stock_qty_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: taobao_stock_qty_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.taobao_stock_qty_id_seq OWNED BY public.taobao_stock_qty.id;
 
 
 --
@@ -3556,6 +3757,114 @@ CREATE VIEW public.v_net_positions AS
 
 
 --
+-- Name: v_portfolio_summary; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_portfolio_summary AS
+ WITH active_positions AS (
+         SELECT ibkr_trad.symbol,
+            sum(ibkr_trad.qty) AS total_qty,
+                CASE
+                    WHEN (sum(ibkr_trad.qty) <> (0)::numeric) THEN round((sum((ibkr_trad.qty * ibkr_trad.price)) / sum(ibkr_trad.qty)), 4)
+                    ELSE (0)::numeric
+                END AS avg_cost
+           FROM public.ibkr_trad
+          GROUP BY ibkr_trad.symbol
+         HAVING (sum(ibkr_trad.qty) <> (0)::numeric)
+        )
+ SELECT p.symbol AS "资产名称",
+    p.total_qty AS "持仓数量",
+    p.avg_cost AS "入场均价",
+    round((p.total_qty * p.avg_cost), 2) AS "账面成本",
+    m.price AS "当前现价",
+    round((p.total_qty * m.price), 2) AS "当前市值",
+    round(((p.total_qty * m.price) - (p.total_qty * p.avg_cost)), 2) AS "浮动盈亏",
+    (round(
+        CASE
+            WHEN (p.avg_cost <> (0)::numeric) THEN (((m.price - p.avg_cost) / p.avg_cost) * (100)::numeric)
+            ELSE (0)::numeric
+        END, 2) || '%'::text) AS "盈亏比例"
+   FROM (active_positions p
+     LEFT JOIN public.market_prices m ON ((p.symbol = m.symbol)))
+  WHERE (p.symbol !~ similar_to_escape('[A-Z]{3}\.[A-Z]{3}'::text));
+
+
+--
+-- Name: v_portfolio_summary_with_weights; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_portfolio_summary_with_weights AS
+ WITH usd_total_funding AS (
+         SELECT COALESCE(sum(
+                CASE
+                    WHEN (ibkr_trad.asset = '存款'::text) THEN ibkr_trad.proceeds
+                    WHEN (ibkr_trad.asset = '外汇'::text) THEN ibkr_trad.qty
+                    ELSE (0)::numeric
+                END), (0)::numeric) AS total_usd_injected
+           FROM public.ibkr_trad
+          WHERE ((ibkr_trad.asset = ANY (ARRAY['存款'::text, '外汇'::text])) AND (ibkr_trad.symbol = ANY (ARRAY['USD.HKD'::text, 'USD.CNH'::text, 'USD'::text])))
+        ), active_positions AS (
+         SELECT ibkr_trad.symbol,
+            sum(ibkr_trad.qty) AS total_qty,
+                CASE
+                    WHEN (sum(ibkr_trad.qty) <> (0)::numeric) THEN round((sum((ibkr_trad.qty * ibkr_trad.price)) / sum(ibkr_trad.qty)), 4)
+                    ELSE (0)::numeric
+                END AS avg_cost
+           FROM public.ibkr_trad
+          GROUP BY ibkr_trad.symbol
+         HAVING (sum(ibkr_trad.qty) <> (0)::numeric)
+        )
+ SELECT p.symbol AS "资产名称",
+    p.total_qty AS "持仓数量",
+    p.avg_cost AS "入场均价",
+    round((p.total_qty * p.avg_cost), 2) AS "账面成本",
+    m.price AS "当前现价",
+    round((p.total_qty * m.price), 2) AS "当前市值",
+    round(((p.total_qty * m.price) - (p.total_qty * p.avg_cost)), 2) AS "浮动盈亏",
+    (round(
+        CASE
+            WHEN (p.avg_cost <> (0)::numeric) THEN (((m.price - p.avg_cost) / p.avg_cost) * (100)::numeric)
+            ELSE (0)::numeric
+        END, 2) || '%'::text) AS "盈亏比例",
+    (round(
+        CASE
+            WHEN (f.total_usd_injected <> (0)::numeric) THEN (((p.total_qty * p.avg_cost) / f.total_usd_injected) * (100)::numeric)
+            ELSE (0)::numeric
+        END, 2) || '%'::text) AS "入金权重"
+   FROM ((active_positions p
+     LEFT JOIN public.market_prices m ON ((p.symbol = m.symbol)))
+     CROSS JOIN usd_total_funding f)
+  WHERE (p.symbol !~ similar_to_escape('[A-Z]{3}\.[A-Z]{3}'::text));
+
+
+--
+-- Name: v_script_tasks; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_script_tasks AS
+ WITH active_positions AS (
+         SELECT ibkr_trad.symbol AS raw_symbol,
+            sum(ibkr_trad.qty) AS position_qty
+           FROM public.ibkr_trad
+          GROUP BY ibkr_trad.symbol
+         HAVING (sum(ibkr_trad.qty) <> (0)::numeric)
+        )
+ SELECT p.raw_symbol,
+    p.position_qty,
+        CASE
+            WHEN ((p.raw_symbol ~~ 'T %'::text) OR (p.raw_symbol ~~ like_escape('%_%%'::text, '_'::text))) THEN 'bond'::text
+            ELSE 'stock'::text
+        END AS asset_type,
+        CASE
+            WHEN ((p.raw_symbol ~~ 'T %'::text) OR (p.raw_symbol ~~ like_escape('%_%%'::text, '_'::text))) THEN COALESCE(b.cusip, p.raw_symbol)
+            ELSE p.raw_symbol
+        END AS query_symbol
+   FROM (active_positions p
+     LEFT JOIN public.bond_mapping b ON ((p.raw_symbol = b.short_name)))
+  WHERE (p.raw_symbol !~ similar_to_escape('[A-Z]{3}\.[A-Z]{3}'::text));
+
+
+--
 -- Name: messages; Type: TABLE; Schema: realtime; Owner: -
 --
 
@@ -3567,7 +3876,8 @@ CREATE TABLE realtime.messages (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -3595,6 +3905,7 @@ CREATE TABLE realtime.subscription (
     claims_role regrole GENERATED ALWAYS AS (realtime.to_regrole((claims ->> 'role'::text))) STORED NOT NULL,
     created_at timestamp without time zone DEFAULT timezone('utc'::text, now()) NOT NULL,
     action_filter text DEFAULT '*'::text,
+    selected_columns text[],
     CONSTRAINT subscription_action_filter_check CHECK ((action_filter = ANY (ARRAY['*'::text, 'INSERT'::text, 'UPDATE'::text, 'DELETE'::text])))
 );
 
@@ -3763,6 +4074,13 @@ CREATE TABLE storage.vector_indexes (
 --
 
 ALTER TABLE ONLY auth.refresh_tokens ALTER COLUMN id SET DEFAULT nextval('auth.refresh_tokens_id_seq'::regclass);
+
+
+--
+-- Name: taobao_stock_qty id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.taobao_stock_qty ALTER COLUMN id SET DEFAULT nextval('public.taobao_stock_qty_id_seq'::regclass);
 
 
 --
@@ -4045,6 +4363,14 @@ ALTER TABLE ONLY public.binance_buy_usdt
 
 
 --
+-- Name: bond_mapping bond_mapping_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bond_mapping
+    ADD CONSTRAINT bond_mapping_pkey PRIMARY KEY (short_name);
+
+
+--
 -- Name: ibkr_trad ibkr_trad_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4058,6 +4384,14 @@ ALTER TABLE ONLY public.ibkr_trad
 
 ALTER TABLE ONLY public.ibkr_trad
     ADD CONSTRAINT ibkr_trad_unique UNIQUE (asset, symbol, trade_time, qty, price, proceeds, fee, add_info);
+
+
+--
+-- Name: market_prices market_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.market_prices
+    ADD CONSTRAINT market_prices_pkey PRIMARY KEY (symbol);
 
 
 --
@@ -4085,6 +4419,38 @@ ALTER TABLE ONLY public.settings
 
 
 --
+-- Name: sticky_notes sticky_notes_note_local_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sticky_notes
+    ADD CONSTRAINT sticky_notes_note_local_id_key UNIQUE (note_local_id);
+
+
+--
+-- Name: sticky_notes sticky_notes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sticky_notes
+    ADD CONSTRAINT sticky_notes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: stock_test stock_test_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stock_test
+    ADD CONSTRAINT stock_test_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: taobao_stock_qty taobao_stock_qty_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.taobao_stock_qty
+    ADD CONSTRAINT taobao_stock_qty_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: trade_records trade_records_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4106,6 +4472,14 @@ ALTER TABLE ONLY public.trade_records
 
 ALTER TABLE ONLY public.binance_trades
     ADD CONSTRAINT uniq_symbol_trade UNIQUE (symbol, trade_id);
+
+
+--
+-- Name: messages messages_payload_exclusive; Type: CHECK CONSTRAINT; Schema: realtime; Owner: -
+--
+
+ALTER TABLE realtime.messages
+    ADD CONSTRAINT messages_payload_exclusive CHECK (((payload IS NULL) OR (binary_payload IS NULL))) NOT VALID;
 
 
 --
@@ -4597,6 +4971,27 @@ CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING
 
 
 --
+-- Name: idx_brand; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_brand ON public.taobao_stock_qty USING btree ("品牌");
+
+
+--
+-- Name: idx_code; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_code ON public.taobao_stock_qty USING btree ("英文代码");
+
+
+--
+-- Name: idx_notes_folder; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notes_folder ON public.sticky_notes USING btree (folder);
+
+
+--
 -- Name: notes_archived_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4632,10 +5027,10 @@ CREATE INDEX messages_inserted_at_topic_index ON ONLY realtime.messages USING bt
 
 
 --
--- Name: subscription_subscription_id_entity_filters_action_filter_key; Type: INDEX; Schema: realtime; Owner: -
+-- Name: subscription_subscription_id_entity_filters_action_filter_selec; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_key ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter);
+CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_selec ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter, COALESCE(selected_columns, '{}'::text[]));
 
 
 --
@@ -5193,5 +5588,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict qoRUi9R1CgItznAJ7ydUDu2SrB7nCHCQi2GX64deBpIougvjpoes6USaYTRh9F0
+\unrestrict dHJhG1wtpthqRN7fjAAgPBUgwgLMHj6ambc61NzDDZoHoyjK3q6Qx6wewq8U72O
 
