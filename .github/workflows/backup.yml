@@ -14,13 +14,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 安装 PostgreSQL 17 客户端
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          # 自动检测 Ubuntu 版本代号（兼容有无 lsb_release 的环境）
+          CODENAME=$(lsb_release -cs 2>/dev/null || (. /etc/os-release && echo "$VERSION_CODENAME"))
+          echo "Ubuntu 代号: ${CODENAME}"
+
+          sudo sh -c "echo 'deb http://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client-17
@@ -30,56 +34,103 @@ jobs:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          # Supabase 要求 SSL 连接
+          export PGSSLMODE=require
           DATE=$(date +%Y-%m-%d)
           DIR="backups/${DATE}"
           mkdir -p "${DIR}"
 
+          # 先测试数据库连接
+          if ! psql "${DB_URL}" -c "SELECT 1;" >/dev/null 2>&1; then
+            echo "::error::无法连接到 Supabase 数据库，请检查 SUPABASE_DB_URL 是否正确"
+            exit 1
+          fi
+          echo "数据库连接成功"
+
+          FAILED=0
+
           # 角色与权限
-          pg_dumpall \
+          echo "::group::备份角色与权限"
+          if pg_dumpall \
             --dbname="${DB_URL}" \
             --roles-only \
             --no-role-passwords \
             --no-owner \
             --no-acl \
-            > "${DIR}/roles.sql" 2>/dev/null || echo "-- 无角色变更" > "${DIR}/roles.sql"
+            > "${DIR}/roles.sql" 2>/dev/null; then
+            echo "roles.sql : $(wc -c < ${DIR}/roles.sql) bytes"
+          else
+            echo "-- 无角色变更或备份失败" > "${DIR}/roles.sql"
+            echo "::warning::roles 备份失败，已生成空占位文件"
+          fi
+          echo "::endgroup::"
 
           # 表结构
-          pg_dump \
+          echo "::group::备份表结构"
+          if pg_dump \
             --dbname="${DB_URL}" \
             --schema-only \
             --no-owner \
             --no-acl \
-            > "${DIR}/schema.sql"
+            > "${DIR}/schema.sql" 2>"${DIR}/schema.err"; then
+            echo "schema.sql: $(wc -c < ${DIR}/schema.sql) bytes"
+          else
+            echo "::error::schema 备份失败"
+            cat "${DIR}/schema.err"
+            FAILED=1
+          fi
+          rm -f "${DIR}/schema.err"
+          echo "::endgroup::"
 
           # 数据
-          pg_dump \
+          echo "::group::备份数据"
+          if pg_dump \
             --dbname="${DB_URL}" \
             --data-only \
             --no-owner \
             --no-acl \
-            > "${DIR}/data.sql"
+            > "${DIR}/data.sql" 2>"${DIR}/data.err"; then
+            echo "data.sql  : $(wc -c < ${DIR}/data.sql) bytes"
+          else
+            echo "::error::data 备份失败"
+            cat "${DIR}/data.err"
+            FAILED=1
+          fi
+          rm -f "${DIR}/data.err"
+          echo "::endgroup::"
+
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "::error::备份过程中有步骤失败，请检查上方错误信息"
+            exit 1
+          fi
 
           echo "备份完成: ${DIR}"
-          echo "  roles.sql  : $(wc -c < ${DIR}/roles.sql) bytes"
-          echo "  schema.sql : $(wc -c < ${DIR}/schema.sql) bytes"
-          echo "  data.sql   : $(wc -c < ${DIR}/data.sql) bytes"
 
       - name: 清理 7 天前的旧备份
+        if: always()
         run: |
-          find backups/ -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \; 2>/dev/null || true
+          # 删除 7 天前的备份目录（基于目录名中的日期）
+          find backups/ -maxdepth 1 -type d -name "????-??-??" | while read d; do
+            dir_date=$(basename "$d")
+            dir_epoch=$(date -d "$dir_date" +%s 2>/dev/null || echo 0)
+            cutoff_epoch=$(date -d "7 days ago" +%s)
+            if [ "$dir_epoch" -lt "$cutoff_epoch" ] 2>/dev/null; then
+              echo "删除过期备份: $d"
+              rm -rf "$d"
+            fi
+          done
           echo "当前保留备份:"
-          ls -1 backups/ | grep -v '^\.'
+          ls -1 backups/ | grep -v '^\.' || echo "(无)"
 
       - name: 提交备份
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git add backups/
           if git diff --staged --quiet; then
             echo "数据无变化，跳过提交"
           else
             git commit -m "备份 $(date +%Y-%m-%d)"
-            git push
+            git push origin HEAD:${{ github.ref_name }}
             echo "已提交并推送"
           fi
